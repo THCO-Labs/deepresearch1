@@ -1,0 +1,1 @@
+Research on hankel determinants and their inverses of order two on subclasses of q-difference operators
