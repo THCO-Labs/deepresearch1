@@ -1,6 +1,0 @@
-TODO:
-1. Define Hankel determinants of order two.
-2. Explain q-difference operators and relevant subclasses.
-3. Summarize known results on order‑2 Hankel determinants for these subclasses.
-4. Present formulas for inverses of such determinants.
-5. Identify key papers and applications.
