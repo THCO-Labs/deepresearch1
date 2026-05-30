@@ -1,2 +1,37 @@
+# Secrets
 .env
+
+# Output
 /output
+
+# Virtual envs
+.venv
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+
+# Testing / tooling
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
