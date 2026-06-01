@@ -1,7 +1,8 @@
-deepagents
 tavily-python
 httpx
 markdownify
-langchain-groq
+langchain
+langchain-openai
+langchain-anthropic
 langchain-core
 python-dotenv

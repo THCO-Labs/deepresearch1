@@ -1,19 +1,20 @@
 # Deep Research Agent — Architecture & Design Document
 
-A multi-agent research system that orchestrates web research, synthesizes findings, and produces cited reports. Built with LangChain, Groq inference, and Tavily search. Designed to run on consumer hardware using free-tier APIs.
+A multi-agent research system that orchestrates web research, synthesizes findings, and produces cited reports. Built with LangChain, OpenRouter, Anthropic, and Tavily. Designed to run on free/low-cost API tiers with aggressive call optimization.
 
 ---
 
 ## Table of Contents
 
 1. [System Overview](#system-overview)
-2. [Architecture](#architecture)
-3. [Code Walkthrough](#code-walkthrough)
-4. [Prompt Design](#prompt-design)
-5. [Persistence & Resumability](#persistence--resumability)
-6. [Issues Encountered & Solutions](#issues-encountered--solutions)
-7. [Configuration & Scaling](#configuration--scaling)
-8. [Running the Agent](#running-the-agent)
+2. [Provider Split](#provider-split)
+3. [Architecture](#architecture)
+4. [Code Walkthrough](#code-walkthrough)
+5. [Prompt Design](#prompt-design)
+6. [Persistence & Resumability](#persistence--resumability)
+7. [Issues Encountered & Solutions](#issues-encountered--solutions)
+8. [Configuration & Scaling](#configuration--scaling)
+9. [Running the Agent](#running-the-agent)
 
 ---
 
@@ -25,22 +26,51 @@ The agent follows an **orchestrator/worker pattern**: a top-level orchestrator L
 User Question
      │
      ▼
-┌─────────────┐
-│ Orchestrator │ ── plans research, delegates, synthesizes, writes report
-└──────┬──────┘
-       │ task() tool call
-       ▼
-┌─────────────┐
-│  Sub-Agent   │ ── searches the web via Tavily, returns structured findings
-└──────┬──────┘
-       │ tavily_search() tool call
-       ▼
-┌─────────────┐
-│ Tavily + Web │ ── fetches search results and full page content
-└─────────────┘
+┌──────────────────────────────────┐
+│  Orchestrator                     │
+│  OpenRouter / DeepSeek V3 (free) │  ← plans, delegates, synthesizes, writes report
+└──────────────┬───────────────────┘
+               │ task() tool call
+               ▼
+┌──────────────────────────────────┐
+│  Sub-Agent                        │
+│  Anthropic / Claude Haiku 4.5    │  ← searches the web, returns structured findings
+└──────────────┬───────────────────┘
+               │ tavily_search() tool call (max 2 per sub-agent)
+               ▼
+┌──────────────────────────────────┐
+│  Tavily + Web Fetch               │  ← fetches results and full page content
+└──────────────────────────────────┘
 ```
 
-Every sub-agent's findings are persisted to disk as `findings_N.md`. If the process crashes or hits a rate limit, re-running the script picks up from the saved findings rather than starting from scratch.
+Every sub-agent's findings are saved to disk as `findings_N.md` the moment they complete. If the process crashes or hits a rate limit, re-running picks up from the saved findings.
+
+---
+
+## Provider Split
+
+### Why Two Providers?
+
+Different parts of the pipeline have different requirements:
+
+| Role | Needs | Provider Chosen |
+|------|-------|-----------------|
+| **Orchestrator** | Strong reasoning, planning, long context for synthesis | OpenRouter / DeepSeek V3 `:free` |
+| **Sub-agents** | Reliable tool calling, low latency | Anthropic / Claude Haiku 4.5 |
+
+### Orchestrator: OpenRouter + DeepSeek V3 (free)
+
+OpenRouter's free tier gives 50 req/day (1,000/day with $10 credit loaded). The orchestrator makes ~8-10 calls per run — well within budget. DeepSeek V3 was chosen because it handles long-context synthesis well and is available as a free model on OpenRouter (`:free` suffix).
+
+OpenRouter is accessed via the OpenAI-compatible API using `langchain-openai`'s `ChatOpenAI` with a custom base URL. No new SDK needed.
+
+### Sub-agents: Anthropic / Claude Haiku 4.5
+
+Claude Haiku was chosen for sub-agents for one overriding reason: **it has the most reliable structured tool calling of any available model**. The entire debugging history of this project (see Issues below) was caused by models that either output tool calls as raw text or don't register tools properly. Haiku eliminates that class of problem entirely.
+
+Rate limits: Anthropic Tier 1 (requires $5 minimum deposit) gives **50 RPM** across all Claude models with 50,000 ITPM for Haiku. At 2 searches per sub-agent, each sub-agent consumes ~4 API calls. A full run of 1-2 sub-agents uses ~12-16 Haiku calls — far below the rate limit.
+
+Cost: Haiku 4.5 is $1.00/$5.00 per million tokens input/output. A full research run costs well under $0.01.
 
 ---
 
@@ -48,304 +78,232 @@ Every sub-agent's findings are persisted to disk as `findings_N.md`. If the proc
 
 ### Why Not `deepagents`?
 
-The original codebase used the `deepagents` library (`create_deep_agent`), which provides a high-level orchestrator/sub-agent abstraction. However, `deepagents` has a fundamental incompatibility with Groq's API:
-
-**The problem:** `deepagents` injects a `task()` tool into the LLM's system prompt as text, telling the model "you can call `task()` to delegate." But it never registers `task()` in the API request's `tools` parameter. This works with Anthropic and OpenAI because they're more lenient with tool-calling formats. Groq strictly validates that every tool the model invokes was declared upfront in `tools` — so when the model tried to call `task()`, Groq returned a 400 error:
-
-```
-tool call validation failed: attempted to call tool 'task' which was not in request.tools
-```
-
-**The solution:** Replace `deepagents` with a lightweight manual implementation (~60 lines) that does the same thing — orchestrator delegates to sub-agents — but with `task()` properly registered as a LangChain `@tool`. This gives us full control over tool registration and makes the system Groq-compatible.
-
-### Why Groq over Anthropic?
-
-The agent makes many sequential LLM calls (orchestrator iterations + sub-agent iterations + tool calls). Anthropic's API enforces a 5-request-per-minute rate limit on lower tiers, which an agent loop burns through almost instantly. Groq's free tier has higher request-rate limits and much faster inference (~280-500 tokens/sec), making it practical for agentic workloads.
+The original codebase used `deepagents` (`create_deep_agent`). It has a fundamental incompatibility with any provider except Anthropic and OpenAI: it injects a `task()` tool into the system prompt as text but never registers it in the API request's `tools` parameter. Groq (and OpenRouter) strictly validate that every tool the model invokes was declared upfront. The fix was to replace `deepagents` entirely with a manual ~60-line implementation that registers `task()` as a proper `@tool`.
 
 ### Component Breakdown
 
 | Component | Role | Implementation |
 |-----------|------|----------------|
-| **Orchestrator** | Plans research, delegates to sub-agents, synthesizes, writes report | `_run_agent()` — a tool-calling loop with the model bound to 4 tools |
-| **Sub-agent** | Executes web searches on a specific topic, returns findings | `_run_subagent()` — a tool-calling loop with the model bound to `tavily_search` |
-| **`task()` tool** | Bridge between orchestrator and sub-agent | A registered `@tool` that the orchestrator calls; internally runs `_run_subagent()` |
-| **`tavily_search()` tool** | Web search | Calls Tavily API, fetches full page content, returns truncated markdown |
-| **`write_file()` / `read_file()` tools** | Filesystem persistence | Write/read files in the `output/` directory |
-| **`groq_invoke_with_retry()`** | Resilient LLM calls | Wraps every Groq call with rate-limit detection, wait-time parsing, and exponential backoff |
+| **Orchestrator** | Plans, delegates, synthesizes, writes report | `_run_agent()` — tool-calling loop, bound to 4 tools |
+| **Sub-agent** | Executes web searches, returns structured findings | `_run_subagent()` — tool-calling loop, bound to `tavily_search` |
+| **`task()` tool** | Bridge between orchestrator and sub-agent | `@tool` that calls `_run_subagent()` internally |
+| **`tavily_search()` tool** | Web search + page fetch | Tavily API + `fetch_webpage_content()`, truncated |
+| **`write_file()` / `read_file()`** | Filesystem persistence | Scoped to `output/` directory |
+| **`invoke_with_retry()`** | Resilient LLM calls | Handles 429s with exponential backoff + wait-time parsing |
 | **Progress logger** | Observability | Timestamps every step to `output/progress.md` and stdout |
-| **Resume loader** | Crash recovery | On startup, loads any `findings_*.md` files and injects them into the orchestrator prompt |
+| **Resume loader** | Crash recovery | On startup, injects saved `findings_*.md` into orchestrator prompt |
 
 ---
 
 ## Code Walkthrough
 
-### Environment Setup (Lines 1–31)
+### Environment Setup
 
-```python
-env_path = Path(__file__).parent / ".env"
-if env_path.exists():
-    load_dotenv(env_path)
-```
+Loads three API keys from `.env`: `TAVILY_API_KEY`, `OPENROUTER_API_KEY`, and `ANTHROPIC_API_KEY`. Fails fast with a clear error message if any are missing. `OUTPUT_DIR` is created immediately so all persistence functions can assume it exists.
 
-Loads API keys from a `.env` file adjacent to the script. Fails fast with a clear error message if keys are missing — no silent failures deep in the Groq/Tavily stack.
+### `invoke_with_retry(model, messages, provider_name, max_retries=4)`
 
-`OUTPUT_DIR` is created immediately so all persistence functions can assume it exists.
+Wraps every LLM call with rate-limit handling. On a 429:
+1. Defaults to exponential backoff (15s, 30s, 60s, 120s)
+2. Parses the actual wait time from the error message using regex (`"try again in 19m10s"`)
+3. Sleeps for the parsed duration + 5s buffer
+4. Retries up to 4 times before raising
 
-### Helper Functions (Lines 36–83)
+The `provider_name` parameter is used for logging so you can tell at a glance which provider is being rate-limited.
 
-**`log_progress(message)`** — Dual-writes to `output/progress.md` and stdout. Every significant action (sub-agent start, search query, orchestrator iteration, errors) goes through this. The timestamp format is `HH:MM:SS` for quick scanning.
+### `fetch_webpage_content(url)`
 
-**`save_findings(index, topic, content)`** — Writes sub-agent results to `output/findings_N.md` the moment they're available. This is the key persistence primitive: if the process dies after a sub-agent finishes but before the orchestrator synthesizes, the findings survive on disk.
+Fetches a URL and converts HTML to markdown. Truncated to **3,000 characters** (reduced from 4,000). Each Tavily search fetches 1 URL, so a sub-agent doing 2 searches adds at most ~6,000 chars of webpage content to its context — well within Haiku's limits and the orchestrator's context window.
 
-**`load_existing_findings()`** — Scans `output/` for `findings_*.md` files using glob, parses the index from the filename, and returns a `{index: content}` dict. Called once at the start of `_run_agent()` to detect a resumable state.
+### `tavily_search(query)`
 
-**`groq_invoke_with_retry(model, messages, max_retries=3)`** — The rate-limit handler. On a 429 error, it:
-1. Defaults to progressive backoff (30s, 60s, 90s)
-2. Parses the actual wait time from Groq's error message (`"try again in 19m10s"`) using regex
-3. Sleeps for the parsed duration + 10s buffer
-4. Retries up to `max_retries` times before raising
+Calls Tavily with `max_results=1` (injected, not visible to model). The `InjectedToolArg` annotation hides `max_results` and `topic` from the LLM's tool schema — the model only decides the query, not configuration details.
 
-This handles both per-minute rate limits (short waits) and daily token limits (longer waits).
+### Sub-Agent Runner (`_run_subagent`)
 
-### Tools (Lines 90–166)
+Key design decisions:
 
-**`fetch_webpage_content(url)`** — Fetches a URL and converts HTML to markdown using `markdownify`. The critical addition is **truncation to 4,000 characters**. Without this, a single webpage could consume 50k+ characters of context, and after 2-3 searches the conversation history would exceed Groq's 131k context window.
+- **`MAX_SUBAGENT_SEARCHES = 2`**: Hard cap on searches. After the budget is exhausted, a `HumanMessage` is injected telling the model to stop calling tools and write its findings. This prevents the model from ignoring the budget instruction in the system prompt (models often do).
+- **Separate model instance per run**: Each `_run_subagent` call gets a fresh `bind_tools()` call. This is fine for Haiku since tool binding is cheap.
+- **`save_findings()` on every exit path**: Findings are saved whether the sub-agent finishes normally, hits the iteration limit, or exits early. The original code only saved on clean exits, which caused zero findings files to be written when sub-agents failed.
 
-**`tavily_search(query)`** — Calls the Tavily search API, then fetches full content for each result URL. Uses `InjectedToolArg` for `max_results` and `topic` parameters — these are set programmatically and hidden from the LLM's tool schema, so the model only sees `query` as a parameter. This prevents the model from wasting tokens deciding between topic categories.
-
-**`write_file(filename, content)` / `read_file(filename)`** — Simple filesystem tools scoped to `OUTPUT_DIR`. The orchestrator uses these to save `research_request.md` and `final_report.md` as instructed by its system prompt. These had to be explicitly registered as tools (the original `deepagents` provided them internally).
-
-### Sub-Agent Runner (Lines 368–406)
-
-```python
-def _run_subagent(topic: str) -> str:
-```
-
-A standalone tool-calling loop that:
-
-1. Creates a fresh model instance with `tavily_search` bound as its only tool
-2. Seeds the conversation with the researcher system prompt + the topic
-3. Loops: invoke model → if no tool calls, return content as findings → if tool calls, execute them and append results
-4. Caps at `max_researcher_iterations * 3` iterations (default 9) as a safety valve
-5. Saves findings to disk via `save_findings()` before returning
-
-Each sub-agent gets its own message history, so context doesn't leak between topics.
-
-**Why `bind_tools([tavily_search])` instead of all tools?** The sub-agent should only search — it shouldn't write files or delegate further. Limiting the tool set prevents the sub-agent from going off-script.
-
-### The `task()` Bridge (Lines 409–417)
+### `task()` Bridge Tool
 
 ```python
 @tool
-def task(subagent_type: str, description: str) -> str:
+def task(description: str) -> str:
 ```
 
-This is the architectural linchpin. The orchestrator's system prompt (inherited from the original `deepagents` design) tells it to call `task()` to delegate research. By implementing `task()` as a proper `@tool`, Groq sees it in the API request's `tools` list and accepts the call. Internally it just calls `_run_subagent(description)`.
+The orchestrator's system prompt (from the original design) tells it to call `task()` to delegate. By implementing it as a proper `@tool` registered via `bind_tools()`, OpenRouter sees it in the API request and accepts calls to it. The original `subagent_type` parameter was removed since there's only one sub-agent type.
 
-The `subagent_type` parameter exists for compatibility with the original prompt (which references "research-agent"), but the current implementation ignores it since there's only one sub-agent type.
+### Orchestrator Runner (`_run_agent`)
 
-### Orchestrator Runner (Lines 424–498)
+1. **Resume check**: Loads `findings_*.md`. If found, appends as `## RESUME CONTEXT` in the system prompt.
+2. **Completion check**: Returns `final_report.md` immediately if it exists.
+3. **Main loop**: Up to 20 orchestrator iterations. Each iteration: invoke → execute tool calls → repeat. Saves latest orchestrator text to `orchestrator_latest.md` every iteration.
+4. Tool results truncated to 12,000 chars at the orchestrator level.
+
+### Model Initialization
 
 ```python
-def _run_agent(question: str) -> dict:
+# Orchestrator: OpenRouter via OpenAI-compatible API
+orchestrator_model = ChatOpenAI(
+    model=ORCHESTRATOR_MODEL,
+    openai_api_key=_openrouter_api_key,
+    openai_api_base="https://openrouter.ai/api/v1",
+    ...
+)
+
+# Sub-agents: Anthropic directly
+subagent_model = ChatAnthropic(
+    model=SUBAGENT_MODEL,
+    anthropic_api_key=_anthropic_api_key,
+    ...
+)
 ```
 
-The main execution loop:
-
-1. **Resume check:** Loads any existing `findings_*.md` files. If found, appends a `## RESUME CONTEXT` section to the system prompt containing the findings, with instructions to skip re-researching and go straight to synthesis.
-
-2. **Completion check:** If `final_report.md` already exists, returns it immediately without calling the LLM at all.
-
-3. **Main loop:** Up to 20 iterations of: invoke orchestrator → if no tool calls, break → execute tool calls → append results. The orchestrator has access to all 4 tools (`tavily_search`, `task`, `write_file`, `read_file`).
-
-4. **Observability:** Every iteration saves the orchestrator's latest text output to `orchestrator_latest.md`, so even if the process crashes mid-loop, you can see what the orchestrator was thinking.
-
-Tool results are truncated to 12,000 characters at the orchestrator level (vs 8,000 at the sub-agent level) because the orchestrator needs to see more of the sub-agent's synthesized findings than the sub-agent needs to see of raw webpage content.
-
-### Agent Shim (Line 501)
-
-```python
-agent = type("Agent", (), {"invoke": staticmethod(lambda inp: _run_agent(inp["messages"][0].content))})()
-```
-
-A one-liner that creates an object with an `.invoke()` method matching the interface the `__main__` block expects (same signature as `deepagents`' agent). This keeps the entry point code unchanged from the original.
+OpenRouter uses the OpenAI-compatible endpoint — `langchain-openai`'s `ChatOpenAI` works with a custom `openai_api_base`. The `HTTP-Referer` and `X-Title` headers are required by OpenRouter's API. Anthropic sub-agents use `langchain-anthropic`'s `ChatAnthropic` directly.
 
 ---
 
 ## Prompt Design
 
-The system uses three prompt blocks, all preserved from the original `deepagents` design:
+Three prompt blocks, preserved from original design with one addition to `RESEARCHER_INSTRUCTIONS`:
 
-### `RESEARCH_WORKFLOW_INSTRUCTIONS`
+### `RESEARCH_WORKFLOW_INSTRUCTIONS` (Orchestrator)
+Defines the 6-step workflow, report structure templates, and citation format. Unchanged from original.
 
-The orchestrator's primary directive. Defines a 6-step workflow:
-1. Plan → 2. Save request → 3. Delegate research → 4. Synthesize → 5. Write report → 6. Verify
+### `RESEARCHER_INSTRUCTIONS` (Sub-agent)
+Significantly tightened from original. Key changes:
+- Explicit `{max_searches}` budget variable injected at runtime
+- Instruction to search **once** with a precise query before assessing
+- Explicit stop conditions
+- Removed the verbose "Tool Logs" requirement to reduce output tokens
 
-Also specifies report structure templates (comparison, list, overview) and citation format (`[1]`, `[2]` inline with a `### Sources` section). The citation consolidation instruction ("each unique URL gets one number across ALL sub-agent findings") is important for multi-source reports.
-
-### `RESEARCHER_INSTRUCTIONS`
-
-The sub-agent's directive. Emphasizes efficiency: tool-call budgets (2-3 for simple, 5 max for complex), explicit stop conditions ("3+ sources found", "last 2 searches returned similar info"), and a structured output format with inline citations and a Sources section.
-
-The "think like a human researcher with limited time" framing is a deliberate prompt engineering choice — it discourages the model from exhaustively searching when adequate information is already available, which reduces API calls and context consumption.
-
-### `SUBAGENT_DELEGATION_INSTRUCTIONS`
-
-Guides the orchestrator on when to use 1 vs multiple sub-agents. The strong default is 1 sub-agent for most queries, with parallelization only for explicit comparisons. This is a token-efficiency optimization: on Groq's free tier, each sub-agent loop costs 3-6 API calls, so unnecessary parallelization burns through rate limits fast.
+### `SUBAGENT_DELEGATION_INSTRUCTIONS` (Orchestrator)
+Guides when to use 1 vs multiple sub-agents. Default is always 1. Unchanged from original.
 
 ---
 
 ## Persistence & Resumability
 
-The agent writes several files to the `output/` directory during execution:
-
 | File | Written by | Purpose |
 |------|-----------|---------|
-| `progress.md` | `log_progress()` | Timestamped log of every action — searchable post-mortem |
-| `findings_N.md` | `save_findings()` | Sub-agent results, one per delegation. Survives crashes. |
-| `orchestrator_latest.md` | Orchestrator loop | Last orchestrator output — see what it was thinking if it crashes |
-| `research_request.md` | Orchestrator (via `write_file`) | The original question, saved for self-verification |
-| `final_report.md` | Orchestrator (via `write_file`) | The final synthesized report |
+| `progress.md` | `log_progress()` | Timestamped log of every action |
+| `findings_N.md` | `save_findings()` | Sub-agent results, one per delegation |
+| `orchestrator_latest.md` | Orchestrator loop | Last orchestrator output |
+| `research_request.md` | Orchestrator via `write_file` | The original question |
+| `final_report.md` | Orchestrator via `write_file` | The synthesized report |
 
-### Resume Flow
-
+**Resume flow:**
 ```
 py agent.py
-  │
-  ├─ output/final_report.md exists?
-  │   └─ YES → return it immediately, done
-  │
-  ├─ output/findings_*.md exist?
-  │   └─ YES → inject into system prompt as RESUME CONTEXT
-  │            → orchestrator skips research, goes to synthesis
-  │
-  └─ NO existing files → full run from scratch
+  ├─ final_report.md exists?  →  return immediately
+  ├─ findings_*.md exist?     →  inject as RESUME CONTEXT, skip to synthesis
+  └─ nothing                  →  full run from scratch
 ```
 
-To force a completely fresh run, delete the `output/` folder.
+To force a fresh run: delete the `output/` folder.
 
 ---
 
 ## Issues Encountered & Solutions
 
 ### Issue 1: `groq-1` Model Not Found
-
 **Error:** `groq.NotFoundError: The model 'groq-1' does not exist`
+**Cause:** Invalid Groq model identifier in original code.
+**Fix:** Changed to a valid model ID.
 
-**Cause:** The original code used `model="groq:groq-1"` which isn't a valid Groq model identifier.
-
-**Fix:** Changed to `groq:llama-3.3-70b-versatile`, then ultimately to `groq:openai/gpt-oss-120b`.
-
-### Issue 2: `deepagents` Tool Registration Incompatibility
-
+### Issue 2: `deepagents` Tool Registration Incompatibility with Groq
 **Error:** `tool call validation failed: attempted to call tool 'task' which was not in request.tools`
-
-**Cause:** `deepagents` describes the `task()` tool in the system prompt text but doesn't include it in the Groq API's `tools` parameter. Groq strictly validates that any tool the model invokes was declared in the request. Anthropic/OpenAI are more lenient here.
-
-**Fix:** Replaced `deepagents` entirely with a manual orchestrator/sub-agent implementation where `task()` is a proper `@tool` registered via `bind_tools()`.
+**Cause:** `deepagents` describes `task()` in the system prompt text but never registers it in the API's `tools` parameter. Groq (unlike Anthropic/OpenAI) strictly validates this.
+**Fix:** Replaced `deepagents` with a manual orchestrator/sub-agent implementation where `task()` is a proper registered `@tool`.
 
 ### Issue 3: Missing `write_file` / `read_file` Tools
-
 **Error:** `attempted to call tool 'write_file' which was not in request.tools`
-
-**Cause:** The orchestrator's system prompt tells it to use `write_file()` and `read_file()`, but after removing `deepagents` (which provided them internally), they weren't defined or registered.
-
-**Fix:** Added explicit `@tool` definitions for both, plus `OUTPUT_DIR` setup. Registered them in the orchestrator's `bind_tools()` and `tool_map`.
+**Cause:** `deepagents` provided these tools internally. After removing it, they weren't defined or registered.
+**Fix:** Added explicit `@tool` definitions and registered them in `bind_tools()`.
 
 ### Issue 4: Llama 70B Broken Tool-Calling Format
-
-**Error:** `Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details.`
-
-**Cause:** Llama 3.3 70B on Groq emits tool calls in a raw text format (`<function=tavily_search{...}></function>`) instead of structured `tool_calls` JSON. Groq's API rejects this malformed format.
-
-**Fix:** Switched from `llama-3.3-70b-versatile` to `openai/gpt-oss-120b`, which has reliable structured tool-calling on Groq.
+**Error:** `Failed to call a function... failed_generation: '<function=tavily_search{...}>'`
+**Cause:** Llama 3.3 70B on Groq emits tool calls as raw text (`<function=...>`) instead of structured JSON. Groq's API rejects this.
+**Fix:** Switched to `openai/gpt-oss-120b` on Groq, which has reliable structured tool calling.
 
 ### Issue 5: Context Window Overflow
-
 **Error:** `Please reduce the length of the messages or completion.`
-
-**Cause:** `fetch_webpage_content()` was returning entire web pages (often 50,000+ characters) as markdown. After 2-3 Tavily searches, the conversation history exceeded Groq's 131k context window.
-
-**Fix:** Three truncation layers:
-- `fetch_webpage_content()` truncates each page to 4,000 characters
-- Sub-agent tool results capped at 8,000 characters per message
-- Orchestrator tool results capped at 12,000 characters per message
+**Cause:** `fetch_webpage_content()` returned full web pages (50,000+ chars). After 2-3 searches, conversation history exceeded the context window.
+**Fix:** Truncated pages to 3,000 chars, sub-agent results to 6,000, orchestrator results to 12,000.
 
 ### Issue 6: Groq Daily Token Limit (200k TPD)
-
 **Error:** `Rate limit reached... Limit 200000, Used 199306`
+**Cause:** Groq's free tier has a 200k tokens/day limit. A multi-search agent run consumes most of it, and the retry waits stretched a single run to 6+ hours.
+**Fix:** Moved sub-agents to Anthropic Haiku (50 RPM, ~$0.01/run) and orchestrator to OpenRouter free (50 req/day, sufficient for orchestration). Added `invoke_with_retry()` with exponential backoff.
 
-**Cause:** Groq's free tier allows only 200,000 tokens per day. A single research run with multiple sub-agent delegations and webpage fetches can consume most of this budget.
+### Issue 7: Sub-agents Ignored Search Budget
+**Cause:** The researcher prompt said "use 2-3 searches maximum" but the model often ignored this instruction and continued searching.
+**Fix:** Added a hard programmatic check: after `MAX_SUBAGENT_SEARCHES` searches are counted in the Python loop, a `HumanMessage` is injected forcing the model to write its final answer. The model cannot bypass an injected message the way it can ignore a system prompt instruction.
 
-**Fix:** Added `groq_invoke_with_retry()` with automatic backoff and wait-time parsing. Added persistence so interrupted runs can resume from saved findings instead of starting over.
+### Issue 8: No Findings Files Saved on Sub-agent Failure
+**Cause:** `save_findings()` was only called on clean exits (normal completion or iteration limit). When a sub-agent failed due to a rate-limit `RuntimeError`, it exited via the exception path and never wrote a findings file — so resuming a failed run had nothing to resume from.
+**Fix:** Ensured `save_findings()` is called on every exit path in `_run_subagent`.
 
 ---
 
 ## Configuration & Scaling
 
-### Key Config Values
+### Key Config Variables (top of file)
 
-| Variable | Default | Location | Notes |
-|----------|---------|----------|-------|
-| `GROQ_MODEL` | `openai/gpt-oss-120b` | Line 361 + 379 | Change in both places |
-| `max_researcher_iterations` | `3` | Line 339 | Sub-agent search rounds |
-| `max_concurrent_research_units` | `3` | Line 338 | Max parallel sub-agents |
-| Orchestrator max iterations | `20` | Line 470 | Hard cap on orchestrator loop |
-| Webpage truncation | `4000` chars | Line 99 | Per-page content limit |
-| Sub-agent result truncation | `8000` chars | Line 402 | Per-tool-call limit |
-| Orchestrator result truncation | `12000` chars | Line 495 | Per-tool-call limit |
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `ORCHESTRATOR_MODEL` | `deepseek/deepseek-chat-v3-0324:free` | Any OpenRouter free model |
+| `SUBAGENT_MODEL` | `claude-haiku-4-5` | Switch to `claude-sonnet-4-6` for higher quality |
+| `MAX_SUBAGENT_SEARCHES` | `2` | Increase for more thorough research |
+| `max_researcher_iterations` | `3` | Max sub-agent delegation rounds |
+| `max_concurrent_research_units` | `3` | Max parallel sub-agents (prompt guidance only) |
 
-### Multi-Key Rotation (For Higher Throughput)
+### Switching Models
 
-Rate limits on Groq's free tier are per-organization. To increase throughput, create multiple Groq accounts and rotate keys:
-
-```env
-GROQ_API_KEY_1=gsk_abc...
-GROQ_API_KEY_2=gsk_def...
-GROQ_API_KEY_3=gsk_ghi...
+To use Sonnet for sub-agents (higher quality, ~10x cost):
+```python
+SUBAGENT_MODEL = "claude-sonnet-4-6"
 ```
 
+To use a different OpenRouter free model for the orchestrator:
 ```python
-import itertools
-_keys = [os.getenv(f"GROQ_API_KEY_{i}") for i in range(1, 4)]
-_key_cycle = itertools.cycle([k for k in _keys if k])
-
-def get_next_model():
-    return init_chat_model(
-        model="groq:openai/gpt-oss-120b",
-        temperature=0.0,
-        api_key=next(_key_cycle),
-    )
+ORCHESTRATOR_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 ```
 
 ---
 
 ## Running the Agent
 
-### Prerequisites
+### Install Dependencies
 
 ```bash
-pip install langchain langchain-groq langchain-core tavily-python httpx markdownify python-dotenv
+pip install langchain langchain-openai langchain-anthropic langchain-core \
+            tavily-python httpx markdownify python-dotenv
 ```
 
-### Environment
-
-Create a `.env` file in the same directory as `agent.py`:
+### Environment (`.env` file)
 
 ```env
-GROQ_API_KEY=gsk_your_key_here
 TAVILY_API_KEY=tvly-your_key_here
+OPENROUTER_API_KEY=sk-or-your_key_here
+ANTHROPIC_API_KEY=sk-ant-your_key_here
 ```
 
-### Execution
+Get keys from:
+- Tavily: https://app.tavily.com
+- OpenRouter: https://openrouter.ai/keys
+- Anthropic: https://console.anthropic.com/keys (requires $5 minimum deposit for Tier 1)
+
+### Run
 
 ```bash
 py agent.py
 ```
 
-### Output
-
-All files are written to `output/` adjacent to the script:
+### Output Files
 
 ```
 output/
@@ -353,13 +311,13 @@ output/
 ├── findings_1.md            # Sub-agent #1 results
 ├── findings_2.md            # Sub-agent #2 results (if applicable)
 ├── orchestrator_latest.md   # Orchestrator's last output
-├── research_request.md      # Saved question (for verification)
+├── research_request.md      # Saved question (for self-verification)
 └── final_report.md          # The final synthesized report
 ```
 
 ### Resuming After a Crash
 
-Just run `py agent.py` again. The agent will detect existing findings and skip to synthesis.
+Just run `py agent.py` again. Existing `findings_*.md` files are detected and the orchestrator skips to synthesis.
 
 ### Starting Fresh
 
