@@ -1,0 +1,45 @@
+{
+  "data": {
+    "source_root": "C:/Users/Dell/deep_research_bench",
+    "query_file": "data/prompt_data/query.jsonl",
+    "criteria_file": "data/criteria_data/criteria.jsonl",
+    "reference_file": "data/test_data/cleaned_data/reference.jsonl"
+  },
+  "agent": {
+    "type": "dra_agent",
+    "name": "dra-agent",
+    "module_path": "C:/Users/Dell/dra/agent.py",
+    "function": "run_research"
+  },
+  "judge": {
+    "race": {
+      "provider": "openai_compatible",
+      "backend": "openrouter",
+      "model": "openai/gpt-5.5",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY"
+    },
+    "fact": {
+      "provider": "openai_compatible",
+      "backend": "openrouter",
+      "model": "openai/gpt-5.4-mini",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "fact_model": "openai/gpt-5.4-mini"
+    }
+  },
+  "run": {
+    "output_root": "eval_runs",
+    "limit": null,
+    "only_zh": false,
+    "only_en": false,
+    "force": false,
+    "max_workers": 5
+  },
+  "features": {
+    "run_race": true,
+    "run_fact": false,
+    "skip_cleaning": false,
+    "dry_run": false
+  }
+}
