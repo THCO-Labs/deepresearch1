@@ -1,97 +1,66 @@
 # Deep Research Agent Evaluation Harness
 
-This directory contains a modular harness for running the `deep_research_bench` evaluation on `dra/agent.py` or any compatible agent implementation.
+This package is the in-house evaluation harness for running `deep_research_bench` against `dra/agent.py` (and other agents) in a reproducible, portable way.
 
-## Architecture
+The goal is:
 
-The harness is split into four loosely coupled layers:
+- keep benchmark logic isolated from agent internals,
+- standardize how all agents are invoked,
+- run on Windows/macOS/Linux without Bash assumptions,
+- keep each run fully reproducible inside `eval_runs/<run_id>/`.
 
-- `eval_harness.datasets` loads and filters task prompts.
-- `eval_harness.agents` is the adapter layer that normalizes all agent interfaces.
-- `eval_harness.judges` builds judge environment variables used by DRB scripts.
-- `eval_harness.pipelines` (future extension point) will hold dedicated scoring/validation flows.
+## Table of contents
 
-The Python CLI in `eval_harness.cli` wires those layers together through `eval_harness.engine.EvaluationHarness`.
+1. [Architecture in plain terms](#architecture-in-plain-terms)
+2. [Quick start](#quick-start)
+3. [How questions are loaded and passed to an agent](#how-questions-are-loaded-and-passed-to-an-agent)
+4. [What “agent adapters” are and how to use them](#what-agent-adapters-are-and-how-to-use-them)
+5. [Swap in another agent](#swap-in-another-agent)
+6. [Run and output locations](#run-and-output-locations)
+7. [CLI usage reference](#cli-usage-reference)
+8. [Judge configuration and comparison discipline](#judge-configuration-and-comparison-discipline)
+9. [Resume and rerun behavior](#resume-and-rerun-behavior)
+10. [Troubleshooting checklist](#troubleshooting-checklist)
 
-### Adapter contract
+## Architecture in plain terms
 
-All adapters return an article string:
+The harness has four layers:
 
-- Input: `task` dict with at least `id`, `prompt`, `language`, `topic`
-- Output: Markdown/text article string for that prompt
+1. `datasets`: load and filter benchmark tasks from `query.jsonl`.
+2. `agents`: normalize all possible agent implementations behind one interface.
+3. `judges`: prepare environment variables used by DRB scoring scripts.
+4. `engine`: orchestrates run folder creation, generation, RACE, FACT, and summaries.
 
-Built-in adapters:
+Execution flow for `python -m eval_harness run`:
 
-- `dra_agent`: imports a module and calls `run_research(question=..., output_dir=..., fresh=...)`
-- `python_callable`: imports `module:function` and calls it with `(question, output_dir=..., fresh=...)`
-- `command`: executes a shell command with templated placeholders
-- `raw_jsonl`: reads `id`/`prompt` rows from a precomputed JSONL file
+- read config
+- build run folder in `eval_runs/<run_id>/`
+- copy benchmark workspace needed by DRB into `eval_runs/<run_id>/bench`
+- load and filter tasks
+- run one task at a time through selected adapter
+- persist task outputs
+- optionally run RACE
+- optionally run FACT
+- write `manifest.json`, `summary.txt`, and stage outputs
 
-### Isolation design
+## Quick start
 
-`generate` runs each task in its own directory:
+The quick start is the fastest safe path:
 
-- `eval_runs/<run_id>/tasks/<task_id>/`
+1. Install dependencies from `requirements.txt`.
+2. Ensure API keys are available in environment (or `.env`).
+3. Run a 1-task English smoke test.
+4. Run a small batch before full benchmarking.
 
-This prevents cross-task leakage of `agent.py` state such as `final_report.md` or local cache files.
+### 1) Install dependencies
 
-### Run lifecycle
+```bash
+python -m pip install -r requirements.txt
+```
 
-1. `prepare()` creates a unique `run_id` and initializes `eval_runs/<run_id>/`.
-2. The benchmark workspace is copied from `data_root` into `eval_runs/<run_id>/bench`.
-3. Tasks are loaded and filtered from `query.jsonl`.
-4. Agents produce one article per task and write raw JSONL.
-5. Optional scoring stages run:
-6. RACE stage (`deepresearch_bench_race.py`) when enabled.
-7. FACT stage (`utils.extract`, `utils.deduplicate`, `utils.scrape`, `utils.validate`, `utils.stat`) when enabled.
-8. `manifest.json` is finalized and a compact summary is produced.
+### 2) Set environment variables
 
-## What the harness evaluates
-
-- RACE scoring (default enabled): criterion alignment + structure from DRB.
-- FACT scoring (default disabled because scraping is optional): citation extraction and validation.
-- Output cleaning pass is done by DRB unless `--skip-cleaning` is used.
-
-RACE does not require `JINA_API_KEY`.  
-FACT requires web-capture support and will fail clearly if `JINA_API_KEY` is missing unless FACT is disabled.
-
-## Folder layout created per run
-
-Each run writes artifacts under `eval_runs/<run_id>/`:
-
-- `manifest.json`
-- `raw/<agent-id>.jsonl`
-- `cleaned/<agent-id>.jsonl`
-- `race/<agent-id>/`
-  - `race_result.txt`
-- `fact/extracted.jsonl`
-- `fact/deduplicated.jsonl`
-- `fact/scraped.jsonl`
-- `fact/validated.jsonl`
-- `fact/fact_result.txt`
-- `summary.txt`
-- `logs/agent/*.log`, `logs/judge/*.log` (when available)
-- `tasks/<task_id>/` (per-task agent output directory)
-- `bench/` (copied benchmark workspace)
-
-`summary.txt` contains a human-readable high-level result, while `manifest.json` stores machine-readable metadata and run summary.
-
-## Configuration
-
-Primary configuration file: `configs/dra.example.json`.
-
-Key sections:
-
-- `data`: benchmark data location and dataset filenames
-- `agent`: adapter setup
-- `judge.race`: judge model/provider settings for RACE
-- `judge.fact`: judge model/provider settings for FACT
-- `run`: output root, filters, concurrency, resume controls
-- `features`: enable/disable pipeline stages
-
-## Quick start for `dra/agent.py`
-
-1. Set up environment variables:
+Minimum for smoke run:
 
 ```bash
 TAVILY_API_KEY=...
@@ -99,77 +68,267 @@ OPENROUTER_API_KEY=...
 ANTHROPIC_API_KEY=...
 ```
 
-2. Ensure dependencies are installed from `requirements.txt`.
+If FACT is enabled, you also need:
 
-3. Run a smoke test:
+```bash
+JINA_API_KEY=...
+```
+
+### 3) Smoke run (recommended first command)
 
 ```bash
 python -m eval_harness run --config configs/dra.example.json --limit 1 --only-en --no-fact
 ```
 
-4. Run a larger batch (example):
+What this does:
+
+- loads only 1 English benchmark question,
+- runs agent generation,
+- runs RACE (enabled by default),
+- skips FACT (`--no-fact`),
+- writes to `eval_runs/run_<timestamp>/...`.
+
+### 4) Small scaled run
 
 ```bash
 python -m eval_harness run --config configs/dra.example.json --limit 2 --only-en --no-fact
 ```
 
-If needed, skip FACT for quick turnaround with `--no-fact` in the command or `"run_fact": false` in config.
-
-## CLI
+If this looks good, drop `--limit` for more tasks and add FACT if needed:
 
 ```bash
-python -m eval_harness run --config <config> [--limit N] [--only-en|--only-zh] [--force] [--no-race] [--no-fact] [--skip-cleaning] [--dry-run]
-python -m eval_harness generate --config <config> [--limit N] [--only-en|--only-zh]
-python -m eval_harness race --config <config> [--run-dir if implemented later]
-python -m eval_harness fact --config <config> [--run-dir if implemented later]
-python -m eval_harness summarize <run_dir>
+python -m eval_harness run --config configs/dra.example.json --limit 2 --only-en
 ```
+
+## How questions are loaded and passed to an agent
+
+The harness does not ask for single ad-hoc questions. It reads tasks from:
+
+`<data.source_root>/<data.query_file>`
+
+Defaults in `configs/dra.example.json` resolve to:
+
+- `source_root`: `C:/Users/Dell/deep_research_bench`
+- `query_file`: `data/prompt_data/query.jsonl`
+
+Each line in JSONL should include:
+
+- `id` (int)
+- `prompt` (string)
+- `language` (`en` or `zh`)
+- `topic` (string)
+
+For each selected task, the harness calls the adapter with:
+
+- `question`: task `prompt`
+- `output_dir`: isolated directory for that task: `eval_runs/<run_id>/tasks/<id>/`
+- `fresh=True` (always on by default in current adapters)
+
+That means each task is isolated and cannot clobber another task’s files.
+
+## What agent adapters are and how to use them
+
+An adapter is a shim that turns different ways of calling agents into one common output format: **a string article/report**.
+
+Every adapter must provide:
+
+- input: `task` dict (`id`, `prompt`, `language`, `topic`)
+- output: string containing report text
+
+### Built-in adapter types
+
+- `dra_agent`: call current `agent.py` API (`run_research(question, output_dir, fresh)`).
+- `python_callable`: call any importable Python function.
+- `command`: execute any shell command with placeholders.
+- `raw_jsonl`: reuse precomputed outputs from a JSONL file.
 
 ## Swap in another agent
 
-### Python callable
+Use one agent block in config. Replace only the `agent` section unless your environment also differs.
+
+### A) Default `dra_agent` (current `dra/agent.py`)
+
+```json
+{
+  "agent": {
+    "type": "dra_agent",
+    "name": "dra-agent",
+    "module_path": "C:/Users/Dell/dra/agent.py",
+    "function": "run_research",
+    "command": null,
+    "jsonl_path": null,
+    "extra": {}
+  }
+}
+```
+
+Meaning:
+
+- `type: dra_agent` tells harness to load a module and call a function by name.
+- `module_path` is the absolute/relative Python file path.
+- `function` must exist and return article markdown/text.
+
+When to edit:
+
+- only if module path or function name changes, for example if your file moves or you rename the entry function.
+
+### B) Python callable adapter
+
+Use this when teammates have a reusable package module.
 
 ```json
 {
   "agent": {
     "type": "python_callable",
-    "module_path": "my_pkg.my_agent",
-    "function": "run_research",
-    "name": "my-agent"
+    "name": "team-agent",
+    "module_path": "my_team_agents.research_agent",
+    "function": "run_research"
   }
 }
 ```
 
-### Command adapter
+What happens at runtime:
+
+- imports `my_team_agents.research_agent`
+- invokes `run_research(question=<prompt>, output_dir=<task_dir>, fresh=True)`
+- expects a string return
+
+Equivalent colon syntax is supported by the harness:
+
+```json
+"function": "my_team_agents.research_agent:run_research"
+```
+
+When to use this:
+
+- code-based teams running inside same runtime / virtual env,
+- no shell wrapper needed,
+- easiest for unit-testable agent logic.
+
+### C) Command adapter
+
+Use this for standalone CLIs, compiled binaries, or wrappers.
 
 ```json
 {
   "agent": {
     "type": "command",
-    "name": "cmd-agent",
-    "command": "python -m my_agent_runner --question \"{prompt}\" --output-file \"{output_file}\""
+    "name": "cli-agent",
+    "command": "python -m team_agent_runner --question \"{prompt}\" --output-file \"{output_file}\"",
+    "extra": {
+      "workdir": "C:/path/to/team/agent/repo"
+    }
   }
 }
 ```
 
-### Raw JSONL adapter
+Placeholder keys:
+
+- `{prompt}`: raw question text
+- `{task_id}`: task id
+- `{run_dir}`: task folder (`eval_runs/<run_id>/tasks/<id>`)
+- `{prompt_file}`: file containing prompt text
+- `{output_file}`: file to read output from if stdout is empty
+
+How output is consumed:
+
+- primary: parser reads command stdout,
+- fallback: reads `{output_file}` if output file exists.
+
+What to change:
+
+- set `command` to your CLI format,
+- set `extra.workdir` if the command depends on repo cwd.
+
+### D) Raw JSONL adapter
+
+Use this when you already have outputs and only want scoring.
 
 ```json
 {
   "agent": {
     "type": "raw_jsonl",
     "name": "baseline",
-    "jsonl_path": "/path/to/precomputed.jsonl"
+    "jsonl_path": "C:/path/to/precomputed.jsonl",
+    "jsonl_key": "id"
   }
 }
 ```
 
-## Swap judge providers and keys
+Row format expected:
+
+- `id` or `prompt` identifies row,
+- `article` (or `text`) contains text content.
+
+## Run and output locations
+
+Default output root is `eval_runs/`.
+
+Each run creates:
+
+- `eval_runs/<run_id>/`
+- `eval_runs/<run_id>/raw/<agent>.jsonl`
+- `eval_runs/<run_id>/race/<agent>/`
+- `eval_runs/<run_id>/fact/`
+- `eval_runs/<run_id>/tasks/<task_id>/`
+- `eval_runs/<run_id>/bench/` (copied benchmark workspace)
+- `eval_runs/<run_id>/manifest.json`
+- `eval_runs/<run_id>/summary.txt`
+
+You can change output location without changing commands by editing:
+
+```json
+"run": {
+  "output_root": "eval_runs"
+}
+```
+
+Or override `run_id` for named runs:
+
+```bash
+python -m eval_harness run --config configs/dra.example.json --run-id teamA_2026_06_10
+```
+
+Important: each run is isolated. Do not reuse `run_id` unless you intend to inspect or append that exact run.
+
+## CLI usage reference
+
+### Common full command
+
+```bash
+python -m eval_harness run --config <path> [options]
+```
+
+Common options:
+
+- `--limit N`
+- `--only-en` / `--only-zh`
+- `--force`
+- `--no-race`
+- `--no-fact`
+- `--skip-cleaning`
+- `--dry-run`
+- `--run-id <name>`
+- `--max-workers N`
+
+### Command variants
+
+```bash
+python -m eval_harness generate --config <path> [--limit N] [--only-en|--only-zh]
+python -m eval_harness race --config <path> [--limit N]
+python -m eval_harness fact --config <path> [--limit N]
+python -m eval_harness summarize <run_dir>
+```
+
+`generate` only writes `raw/<agent>.jsonl`.
+
+`run` runs generation + enabled scoring stages.
+
+`summarize` prints manifest summary from an existing run.
+
+## Judge configuration and comparison discipline
 
 RACE and FACT are configured separately:
-
-- Set `judge.race` and `judge.fact` blocks independently.
-- Example with OpenRouter-compatible endpoint:
 
 ```json
 {
@@ -193,26 +352,42 @@ RACE and FACT are configured separately:
 }
 ```
 
-To compare across agents, keep judge config identical so scores remain comparable.
+Changing judge settings changes score baselines. For fair model/agent comparisons, keep judge config identical and only change agent block.
 
-## Run control and resume behavior
+## Resume and rerun behavior
 
-- `--limit` and `only_en`/`only_zh` reduce the task set.
-- `--force` re-runs completed task ids in the filtered set.
-- `--no-race` / `--no-fact` run only the selected stages.
-- If RACE/FACT artifacts already exist and `--force` is not set, existing task rows are reused by task id.
+- Existing task rows are reused by task id unless `--force` is used.
+- `--force` re-runs selected tasks and updates outputs.
+- Existing per-run scoring artifacts are reused/extended safely.
+- `--dry-run` creates structure and manifest but skips generation.
 
-## Expected outputs by stage
+This enables:
 
-- `generate`: only `raw/<agent-id>.jsonl` is guaranteed.
-- `run`: generate + enabled scoring stages.
-- `summarize`: reads and prints `manifest.json["summary"]` if present.
+- interrupted-run recovery,
+- incremental expansion (new run ids),
+- fixed historical comparisons (pinned run config + judge model).
 
-## Notes from design intent
+## Run artifact meanings (what your team will read)
 
-- Cross-platform (Windows/macOS/Linux) by using Python orchestration.
-- No Bash-only assumptions.
-- Resumable JSONL writes with task-id keys.
-- All generated benchmark artifacts stay under `eval_runs/<run_id>/`.
-- Copying benchmark data/scripts into each run folder makes runs reproducible and avoids hard dependency on external working directories.
-- `.gitignore` should include `eval_runs/` to keep large run artifacts out of version control.
+The harness writes:
+
+- `manifest.json`: config snapshot + environment-independent metadata + run summary,
+- `summary.txt`: human-readable summary,
+- `raw/<agent>.jsonl`: normalized raw outputs,
+- `race/<agent>/race_result.txt`: RACE metrics when enabled,
+- `fact/*`: FACT intermediate and final score files when enabled.
+
+## Troubleshooting checklist
+
+- If agent output is `"ERROR: ..."` in raw JSONL, install missing dependencies in your environment first.
+- If DRB scripts fail due to missing key, ensure judge env variables are set as configured.
+- If benchmark copy feels slow or flaky, run with `--limit 1` first to validate connectivity.
+- If FACT fails with missing endpoint key, run with `--no-fact` or provide `JINA_API_KEY`.
+
+## Suggested team workflow
+
+1. Freeze judge config for the comparison window.
+2. Create a per-team named `run_id`.
+3. Run smoke tests and then controlled batches.
+4. Store run IDs + notes externally (or in your lab tracker).
+5. Compare using manifest metadata + `summary.txt`, and keep score interpretations tied to the exact judge model.
