@@ -8,6 +8,7 @@ from datetime import datetime
 import httpx
 from langchain.tools import InjectedToolArg, tool
 from markdownify import markdownify
+import openai
 from tavily import TavilyClient
 from dotenv import load_dotenv
 from pathlib import Path
@@ -49,11 +50,14 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # ---------------------------------------------------------------------------
 
 # Orchestrator: OpenRouter free tier (DeepSeek V3 — strong reasoning, free)
-ORCHESTRATOR_MODEL  = "deepseek/deepseek-chat-v3-0324:free"
+#ORCHESTRATOR_MODEL  = "deepseek/deepseek-chat-v3-0324:free"
+#ORCHESTRATOR_MODEL = "openai/gpt-oss-120b:free"
+#ORCHESTRATOR_MODEL = "openrouter/free"
+ORCHESTRATOR_MODEL = "claude-sonnet-4-6"
 
 # Sub-agents: Claude Haiku 4.5 — fast, cheap, best-in-class tool calling
 # Switch to "claude-sonnet-4-6" for higher quality at higher cost
-SUBAGENT_MODEL = "claude-haiku-4-5"
+SUBAGENT_MODEL = "claude-sonnet-4-6"
 
 # Max searches a sub-agent may perform — keep low to save API calls
 MAX_SUBAGENT_SEARCHES = 2
@@ -200,7 +204,7 @@ RESEARCH_WORKFLOW_INSTRUCTIONS = """# Research Workflow
 
 Follow this workflow for all research requests:
 
-1. **Plan**: Create a todo list with write_todos to break down the research into focused tasks
+1. **Plan**: Create a todo list with write_file to break down the research into focused tasks
 2. **Save the request**: Use write_file() to save the user's research question to `/research_request.md`
 3. **Research**: Delegate research tasks to sub-agents using the task() tool - ALWAYS use sub-agents for research, never conduct research yourself
 4. **Synthesize**: Review all sub-agent findings and consolidate citations (each unique URL gets one number across all findings)
@@ -361,7 +365,7 @@ research_sub_agent = {
 }
 
 # Orchestrator: OpenRouter (DeepSeek V3 free)
-orchestrator_model = ChatOpenAI(
+'''orchestrator_model = ChatOpenAI(
     model=ORCHESTRATOR_MODEL,
     openai_api_key=_openrouter_api_key,
     openai_api_base="https://openrouter.ai/api/v1",
@@ -370,6 +374,13 @@ orchestrator_model = ChatOpenAI(
         "HTTP-Referer": "https://github.com/local/research-agent",
         "X-Title": "Research Agent",
     },
+)'''
+
+orchestrator_model = ChatAnthropic(
+    model=ORCHESTRATOR_MODEL,
+    anthropic_api_key=_anthropic_api_key,
+    temperature=0.0,
+    max_tokens=4096,
 )
 
 # Sub-agents: Claude Haiku (Anthropic API directly)
@@ -486,6 +497,7 @@ def _run_agent(question: str) -> dict:
     log_progress(f"Sub-agents will use Anthropic/{SUBAGENT_MODEL}, max {MAX_SUBAGENT_SEARCHES} searches each")
 
     orchestrator = orchestrator_model.bind_tools([tavily_search, task, write_file, read_file])
+
     messages = [
         SystemMessage(content=INSTRUCTIONS + resume_context),
         HumanMessage(content=question),
@@ -504,7 +516,11 @@ def _run_agent(question: str) -> dict:
         messages.append(response)
 
         if response.content:
-            (OUTPUT_DIR / "orchestrator_latest.md").write_text(response.content, encoding="utf-8")
+            if isinstance(response.content, str):
+                content_str = response.content
+            else:
+                content_str = json.dumps(response.content, indent=2)
+            (OUTPUT_DIR / "orchestrator_latest.md").write_text(content_str, encoding="utf-8")
 
         if not response.tool_calls:
             log_progress("Orchestrator finished (no more tool calls).")
@@ -534,8 +550,19 @@ agent = type("Agent", (), {"invoke": staticmethod(lambda inp: _run_agent(inp["me
 
 if __name__ == "__main__":
     question = (
-        "Research on hankel determinants and their inverses of order two "
-        "on subclasses of q-difference operators"
+        "CONTEXT:" +
+"MALA'IKA is Sety.io's emergency response management platform, being tested with an Uber partnership in Lagos and Abuja. It supports SOS calls/form intake from users (in this case, Uber drivers/riders), Command Center validation by agents, responder dispatch, incident tracking, evidence capture, operational analytics, and Uber-facing reports." +
+"Tagline: Technology for Saving Lives"+
+"The MVP is focused on the Uber emergency response vertical:" +
+"1. An Uber driver/rider triggers an SOS." +
+"2. The Command Center receives the request in real time." +
+"3. An agent validates the incident by phone or in-app communication." +
+"4. The system classifies the incident by category, severity, ride status, and location." +
+"5. The agent dispatches the nearest appropriate responder." +
+"6. The requester receives status updates." +
+"7. The case is resolved, closed, and included in analytics/reports." +
+"RESEARCH QUESTION" +
+"The main point of your research is on the question of what would be the most optimal in option for handling calls, in terms of price and quality of service in Nigeria. Compare between using Twilio, and Cloudtalk API to set up the emergency lines which command centre agnets will answer when a requester calls, collect transcripts, which we can then use for automatically creating incidents for agents to then manage by parsing the transcript with an LLM. Compare pricing, users reviews and forum discussions about them, especially on how htey perform in Nigeria, etc. return a full breakdown of the process that will be involved, step by step, for each approach, then make the comaprisons. Think through the user flow, and the processes that will be required for this flow to be complete, both on the requester and agent ends."
     )
     print(f"\n{'='*60}")
     print(f"Research question: {question}")
