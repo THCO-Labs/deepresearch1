@@ -4,6 +4,9 @@
 # Output
 /output
 
+# Evaluation harness outputs
+eval_runs/
+
 # Virtual envs
 .venv
 venv/

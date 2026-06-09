@@ -1,62 +1,43 @@
-import os
-import time
+﻿import argparse
 import json
+import os
 import re
-from typing import Annotated, Literal
+import shutil
+import time
 from datetime import datetime
+from pathlib import Path
+from typing import Annotated, Literal
 
 import httpx
+from dotenv import load_dotenv
 from langchain.tools import InjectedToolArg, tool
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from markdownify import markdownify
 import openai
 from tavily import TavilyClient
-from dotenv import load_dotenv
-from pathlib import Path
 
 # Load .env from the repository root if present
 env_path = Path(__file__).parent / ".env"
 if env_path.exists():
     load_dotenv(env_path)
 
-_tavily_api_key = os.getenv("TAVILY_API_KEY")
-if not _tavily_api_key:
-    raise RuntimeError(
-        "Environment variable TAVILY_API_KEY is not set.\n"
-        "Set it in PowerShell with: $env:TAVILY_API_KEY=\"your_key\"\n"
-        "Or persistently with: setx TAVILY_API_KEY \"your_key\"\n"
-    )
+DEFAULT_OUTPUT_DIR = Path(__file__).parent / "output"
 
-_openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
-if not _openrouter_api_key:
-    raise RuntimeError(
-        "Environment variable OPENROUTER_API_KEY is not set.\n"
-        "Set it in PowerShell with: $env:OPENROUTER_API_KEY=\"your_key\"\n"
-    )
-
-_anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-if not _anthropic_api_key:
-    raise RuntimeError(
-        "Environment variable ANTHROPIC_API_KEY is not set.\n"
-        "Set it in PowerShell with: $env:ANTHROPIC_API_KEY=\"your_key\"\n"
-    )
-
-tavily_client = TavilyClient(api_key=_tavily_api_key)
-
-OUTPUT_DIR = Path(__file__).parent / "output"
-OUTPUT_DIR.mkdir(exist_ok=True)
+# Runtime mutable state (initialized lazily)
+OUTPUT_DIR = DEFAULT_OUTPUT_DIR
+tavily_client = None
+orchestrator_model = None
+subagent_model = None
 
 # ---------------------------------------------------------------------------
 # Model config
 # ---------------------------------------------------------------------------
 
 # Orchestrator: OpenRouter free tier (DeepSeek V3 — strong reasoning, free)
-#ORCHESTRATOR_MODEL  = "deepseek/deepseek-chat-v3-0324:free"
-#ORCHESTRATOR_MODEL = "openai/gpt-oss-120b:free"
-#ORCHESTRATOR_MODEL = "openrouter/free"
 ORCHESTRATOR_MODEL = "claude-sonnet-4-6"
 
 # Sub-agents: Claude Haiku 4.5 — fast, cheap, best-in-class tool calling
-# Switch to "claude-sonnet-4-6" for higher quality at higher cost
 SUBAGENT_MODEL = "claude-sonnet-4-6"
 
 # Max searches a sub-agent may perform — keep low to save API calls
@@ -65,31 +46,89 @@ MAX_SUBAGENT_SEARCHES = 2
 max_concurrent_research_units = 3
 max_researcher_iterations = 3
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
-def log_progress(message: str):
+def _get_keys():
+    """Load API keys from environment at runtime."""
+    return {
+        "tavily": os.getenv("TAVILY_API_KEY"),
+        "openrouter": os.getenv("OPENROUTER_API_KEY"),
+        "anthropic": os.getenv("ANTHROPIC_API_KEY"),
+    }
+
+
+def _ensure_output_dir(output_dir: Path | str | None) -> Path:
+    path = Path(output_dir) if output_dir else Path(OUTPUT_DIR)
+    path = path.expanduser().resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def initialize_runtime(output_dir: Path | str | None = None, force: bool = False) -> Path:
+    """Initialize API clients and tool clients.
+
+    Raises:
+        RuntimeError: If required env vars are not set.
+    """
+    global OUTPUT_DIR, tavily_client, orchestrator_model, subagent_model
+
+    out_dir = _ensure_output_dir(output_dir)
+    if force and out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR = out_dir
+
+    keys = _get_keys()
+    missing = [name for name, value in keys.items() if not value]
+    if missing:
+        missing_str = ", ".join(missing)
+        raise RuntimeError(
+            f"Missing required keys from environment: {missing_str}.\n"
+            "Set them in .env or environment variables before running."
+        )
+
+    tavily_client = TavilyClient(api_key=keys["tavily"])
+
+    orchestrator_model = ChatAnthropic(
+        model=ORCHESTRATOR_MODEL,
+        anthropic_api_key=keys["anthropic"],
+        temperature=0.0,
+        max_tokens=4096,
+    )
+
+    subagent_model = ChatAnthropic(
+        model=SUBAGENT_MODEL,
+        anthropic_api_key=keys["anthropic"],
+        temperature=0.0,
+        max_tokens=4096,
+    )
+
+    return out_dir
+
+
+def log_progress(message: str, output_dir: Path | None = None):
     """Append a timestamped line to output/progress.md and print it."""
+    output_dir = output_dir or OUTPUT_DIR
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"- [{ts}] {message}"
     print(line)
-    with open(OUTPUT_DIR / "progress.md", "a", encoding="utf-8") as f:
+    with open(output_dir / "progress.md", "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
 
-def save_findings(index: int, topic: str, content: str):
+def save_findings(index: int, topic: str, content: str, output_dir: Path | None = None):
     """Save sub-agent findings to a numbered file."""
-    path = OUTPUT_DIR / f"findings_{index}.md"
+    output_dir = output_dir or OUTPUT_DIR
+    path = output_dir / f"findings_{index}.md"
     header = f"# Findings #{index}: {topic}\n\n"
     path.write_text(header + content, encoding="utf-8")
-    log_progress(f"Saved findings to output/findings_{index}.md ({len(content)} chars)")
+    log_progress(f"Saved findings to output/findings_{index}.md ({len(content)} chars)", output_dir)
 
 
-def load_existing_findings() -> dict:
+def load_existing_findings(output_dir: Path | None = None) -> dict:
     """Load any previously saved findings files for resumability."""
+    output_dir = output_dir or OUTPUT_DIR
     findings = {}
-    for p in sorted(OUTPUT_DIR.glob("findings_*.md")):
+    for p in sorted(output_dir.glob("findings_*.md")):
         try:
             idx = int(p.stem.split("_")[1])
             findings[idx] = p.read_text(encoding="utf-8")
@@ -112,8 +151,7 @@ def invoke_with_retry(model, messages, provider_name: str, max_retries: int = 4)
                 or "overloaded" in err_str.lower()
             )
             if is_rate_limit:
-                # Try to parse an explicit wait time from the error message
-                wait = 15 * (2 ** attempt)   # 15s, 30s, 60s, 120s
+                wait = 15 * (2 ** attempt)
                 m = re.search(r"try again in (\d+)m(?:(\d+)s)?", err_str)
                 if m:
                     wait = int(m.group(1)) * 60 + int(m.group(2) or 0) + 5
@@ -128,6 +166,7 @@ def invoke_with_retry(model, messages, provider_name: str, max_retries: int = 4)
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+
 
 def fetch_webpage_content(url: str, timeout: float = 10.0) -> str:
     """Fetch webpage and convert HTML to markdown, truncated to 3000 chars."""
@@ -159,6 +198,10 @@ def tavily_search(
     Returns:
         Formatted search results with full webpage content
     """
+    global tavily_client
+    if tavily_client is None:
+        raise RuntimeError("tavily_client is not initialized. Call initialize_runtime() first.")
+
     search_results = tavily_client.search(query, max_results=max_results, topic=topic)
     result_texts = []
     for result in search_results.get("results", []):
@@ -172,12 +215,7 @@ def tavily_search(
 
 @tool
 def write_file(filename: str, content: str) -> str:
-    """Write content to a file in the output directory.
-
-    Args:
-        filename: Name of the file to write (e.g. 'final_report.md').
-        content: Content to write to the file.
-    """
+    """Write content to a file in the output directory."""
     path = OUTPUT_DIR / filename
     path.write_text(content, encoding="utf-8")
     return f"Successfully wrote {len(content)} characters to output/{filename}"
@@ -185,11 +223,7 @@ def write_file(filename: str, content: str) -> str:
 
 @tool
 def read_file(filename: str) -> str:
-    """Read content from a file in the output directory.
-
-    Args:
-        filename: Name of the file to read.
-    """
+    """Read content from a file in the output directory."""
     path = OUTPUT_DIR / filename
     if not path.exists():
         return f"File output/{filename} does not exist."
@@ -197,7 +231,7 @@ def read_file(filename: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Prompts (unchanged from original)
+# Prompts
 # ---------------------------------------------------------------------------
 
 RESEARCH_WORKFLOW_INSTRUCTIONS = """# Research Workflow
@@ -271,15 +305,15 @@ Simply list items with details - no introduction needed:
 
 RESEARCHER_INSTRUCTIONS = """You are a research assistant conducting research on the user's input topic. For context, today's date is {date}.
 
-Your job is to use the tavily_search tool to gather information. Be highly efficient — you have a strict budget of {max_searches} search calls maximum. Make them count.
+Your job is to use the tavily_search tool to gather information. Be highly efficient â€” you have a strict budget of {max_searches} search calls maximum. Make them count.
 
 Think like a human researcher with limited time:
 
-1. **Read the question carefully** — identify the most specific query that will return useful results
-2. **Search once with a precise query** — broad enough to find relevant pages, specific enough to avoid noise
-3. **Assess immediately** — do you have enough to write a comprehensive answer? If yes, stop and write it
-4. **Search a second time only if clearly needed** — fill a specific gap, not to find more of the same
-5. **Stop at {max_searches} searches** — write your best answer from what you have
+1. **Read the question carefully** â€” identify the most specific query that will return useful results
+2. **Search once with a precise query** â€” broad enough to find relevant pages, specific enough to avoid noise
+3. **Assess immediately** â€” do you have enough to write a comprehensive answer? If yes, stop and write it
+4. **Search a second time only if clearly needed** â€” fill a specific gap, not to find more of the same
+5. **Stop at {max_searches} searches** â€” write your best answer from what you have
 
 **Stop Immediately When**:
 - You can answer the user's question comprehensively from current results
@@ -310,8 +344,8 @@ Your role is to coordinate research by delegating tasks from your TODO list to s
 **ONLY parallelize when the query EXPLICITLY requires comparison OR has clearly independent aspects:**
 
 **Explicit comparisons** -> 1 sub-agent per element:
-- "Compare OpenAI vs Anthropic vs DeepMind AI safety approaches" -> 3 parallel sub-agents
-- "Compare Python vs JavaScript for web development" -> 2 parallel sub-agents
+- "Compare OpenAI vs Anthropic vs DeepMind AI safety approaches" -> 3 sub-agents
+- "Compare Python vs JavaScript for web development" -> 2 sub-agents
 
 **Clearly separated aspects** -> 1 sub-agent per aspect (use sparingly):
 - "Research renewable energy adoption in Europe, Asia, and North America" -> 3 parallel sub-agents (geographic separation)
@@ -334,12 +368,8 @@ Your role is to coordinate research by delegating tasks from your TODO list to s
 
 
 # ---------------------------------------------------------------------------
-# Config / model init
+# Runtime config and tooling
 # ---------------------------------------------------------------------------
-
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
 
 current_date = datetime.now().strftime("%Y-%m-%d")
 
@@ -364,47 +394,21 @@ research_sub_agent = {
     "tools": [tavily_search],
 }
 
-# Orchestrator: OpenRouter (DeepSeek V3 free)
-'''orchestrator_model = ChatOpenAI(
-    model=ORCHESTRATOR_MODEL,
-    openai_api_key=_openrouter_api_key,
-    openai_api_base="https://openrouter.ai/api/v1",
-    temperature=0.0,
-    default_headers={
-        "HTTP-Referer": "https://github.com/local/research-agent",
-        "X-Title": "Research Agent",
-    },
-)'''
-
-orchestrator_model = ChatAnthropic(
-    model=ORCHESTRATOR_MODEL,
-    anthropic_api_key=_anthropic_api_key,
-    temperature=0.0,
-    max_tokens=4096,
-)
-
-# Sub-agents: Claude Haiku (Anthropic API directly)
-subagent_model = ChatAnthropic(
-    model=SUBAGENT_MODEL,
-    anthropic_api_key=_anthropic_api_key,
-    temperature=0.0,
-    max_tokens=4096,
-)
-
-
-# ---------------------------------------------------------------------------
-# Sub-agent runner (Claude Haiku)
-# ---------------------------------------------------------------------------
 
 _findings_counter = 0
+
 
 def _run_subagent(topic: str) -> str:
     """Run the research sub-agent (Claude Haiku) for a single topic."""
     global _findings_counter
+    if subagent_model is None:
+        raise RuntimeError("subagent_model is not initialized. Call initialize_runtime() first.")
+
     _findings_counter += 1
     my_index = _findings_counter
 
-    log_progress(f"Sub-agent #{my_index} started: {topic}...")
+    output_dir = OUTPUT_DIR
+    log_progress(f"Sub-agent #{my_index} started: {topic}...", output_dir)
 
     bound_sub = subagent_model.bind_tools([tavily_search])
 
@@ -416,26 +420,29 @@ def _run_subagent(topic: str) -> str:
     search_count = 0
 
     for iteration in range(MAX_SUBAGENT_SEARCHES * 2 + 2):
-        log_progress(f"  Sub-agent #{my_index} iteration {iteration+1} (searches used: {search_count}/{MAX_SUBAGENT_SEARCHES})...")
+        log_progress(f"  Sub-agent #{my_index} iteration {iteration+1} (searches used: {search_count}/{MAX_SUBAGENT_SEARCHES})...", output_dir)
         response = invoke_with_retry(bound_sub, messages, provider_name="Anthropic/Haiku")
         messages.append(response)
 
         if not response.tool_calls:
             findings = response.content or "(no findings)"
-            save_findings(my_index, topic, findings)
+            save_findings(my_index, topic, findings, output_dir)
             return findings
 
         for tc in response.tool_calls:
             if tc["name"] == "tavily_search":
                 search_count += 1
-                log_progress(f"  Sub-agent #{my_index} searching [{search_count}/{MAX_SUBAGENT_SEARCHES}]: {tc['args'].get('query','?')[:60]}")
+                log_progress(
+                    f"  Sub-agent #{my_index} searching [{search_count}/{MAX_SUBAGENT_SEARCHES}]: "
+                    f"{tc['args'].get('query','?')[:60]}",
+                    output_dir,
+                )
             try:
                 result = tavily_search.invoke(tc["args"])
             except Exception as e:
                 result = f"Tool error: {e}"
             messages.append(ToolMessage(content=str(result)[:6000], tool_call_id=tc["id"]))
 
-        # Inject a hard stop if budget is exhausted
         if search_count >= MAX_SUBAGENT_SEARCHES:
             messages.append(HumanMessage(
                 content=f"You have used all {MAX_SUBAGENT_SEARCHES} searches. "
@@ -443,7 +450,7 @@ def _run_subagent(topic: str) -> str:
             ))
 
     findings = "(sub-agent hit iteration limit)"
-    save_findings(my_index, topic, findings)
+    save_findings(my_index, topic, findings, output_dir)
     return findings
 
 
@@ -458,15 +465,27 @@ def task(description: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator runner (OpenRouter / DeepSeek V3)
+# Orchestrator runner (LLM)
 # ---------------------------------------------------------------------------
 
-def _run_agent(question: str) -> dict:
-    # Resume check
-    existing = load_existing_findings()
+
+def _run_agent(question: str, output_dir: Path | str | None = None, fresh: bool = False) -> dict:
+    if output_dir is not None:
+        output_dir = _ensure_output_dir(output_dir)
+        OUTPUT_DIR = output_dir
+
+    output_dir = output_dir or OUTPUT_DIR
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if fresh and output_dir.exists():
+        for child in output_dir.glob("*.md"):
+            child.unlink(missing_ok=True)
+
+    existing = load_existing_findings(output_dir)
     resume_context = ""
     if existing:
-        log_progress(f"Found {len(existing)} existing findings files — resuming!")
+        log_progress(f"Found {len(existing)} existing findings files — resuming!", output_dir)
         pieces = [f"[Previously saved findings #{i}]:\n{existing[i]}" for i in sorted(existing)]
         resume_context = (
             "\n\n## RESUME CONTEXT\n"
@@ -476,25 +495,28 @@ def _run_agent(question: str) -> dict:
             + "\n\n---\n\n".join(pieces)
         )
 
-    # Already done check
-    final_report_path = OUTPUT_DIR / "final_report.md"
+    final_report_path = output_dir / "final_report.md"
     if final_report_path.exists():
-        log_progress("final_report.md already exists! Reading and returning it.")
-        return {"messages": [
-            SystemMessage(content=""),
-            HumanMessage(content=question),
-            type("Msg", (), {"content": final_report_path.read_text(encoding="utf-8"), "tool_calls": []})()
-        ]}
+        log_progress("final_report.md already exists! Reading and returning it.", output_dir)
+        return {
+            "messages": [
+                HumanMessage(content=question),
+                type("Msg", (), {"content": final_report_path.read_text(encoding="utf-8"), "tool_calls": []})(),
+            ]
+        }
 
-    with open(OUTPUT_DIR / "progress.md", "a", encoding="utf-8") as f:
+    with open(output_dir / "progress.md", "a", encoding="utf-8") as f:
         f.write(f"\n# Run started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Orchestrator: OpenRouter/{ORCHESTRATOR_MODEL}\n")
+        f.write(f"Orchestrator: Anthropic/{ORCHESTRATOR_MODEL}\n")
         f.write(f"Sub-agents:   Anthropic/{SUBAGENT_MODEL}\n")
         f.write(f"Max searches per sub-agent: {MAX_SUBAGENT_SEARCHES}\n")
         f.write(f"Question: {question}\n\n")
 
-    log_progress(f"Orchestrator starting (OpenRouter/{ORCHESTRATOR_MODEL})...")
-    log_progress(f"Sub-agents will use Anthropic/{SUBAGENT_MODEL}, max {MAX_SUBAGENT_SEARCHES} searches each")
+    log_progress(f"Orchestrator starting (Anthropic/{ORCHESTRATOR_MODEL})...", output_dir)
+    log_progress(f"Sub-agents will use Anthropic/{SUBAGENT_MODEL}, max {MAX_SUBAGENT_SEARCHES} searches each", output_dir)
+
+    if orchestrator_model is None:
+        raise RuntimeError("orchestrator_model is not initialized. Call initialize_runtime() first.")
 
     orchestrator = orchestrator_model.bind_tools([tavily_search, task, write_file, read_file])
 
@@ -510,9 +532,9 @@ def _run_agent(question: str) -> dict:
     }
 
     for iteration in range(20):
-        log_progress(f"Orchestrator iteration {iteration+1}...")
+        log_progress(f"Orchestrator iteration {iteration+1}...", output_dir)
 
-        response = invoke_with_retry(orchestrator, messages, provider_name="OpenRouter/DeepSeek")
+        response = invoke_with_retry(orchestrator, messages, provider_name="Anthropic/Sonnet")
         messages.append(response)
 
         if response.content:
@@ -520,38 +542,71 @@ def _run_agent(question: str) -> dict:
                 content_str = response.content
             else:
                 content_str = json.dumps(response.content, indent=2)
-            (OUTPUT_DIR / "orchestrator_latest.md").write_text(content_str, encoding="utf-8")
+            (output_dir / "orchestrator_latest.md").write_text(content_str, encoding="utf-8")
 
         if not response.tool_calls:
-            log_progress("Orchestrator finished (no more tool calls).")
+            log_progress("Orchestrator finished (no more tool calls).", output_dir)
             break
 
         for tc in response.tool_calls:
             tool_name = tc["name"]
-            log_progress(f"Orchestrator calling: {tool_name}({json.dumps({k: str(v)[:60] for k,v in tc['args'].items()})})")
+            args_preview = json.dumps({k: str(v)[:60] for k, v in tc["args"].items()})
+            log_progress(f"Orchestrator calling: {tool_name}({args_preview})", output_dir)
             fn = tool_map.get(tool_name)
             try:
                 result = fn.invoke(tc["args"]) if fn else f"Unknown tool: {tool_name}"
             except Exception as e:
                 result = f"Tool error: {e}"
-                log_progress(f"  Tool error: {e}")
+                log_progress(f"  Tool error: {e}", output_dir)
             messages.append(ToolMessage(content=str(result)[:12000], tool_call_id=tc["id"]))
 
-    log_progress("Run complete.")
+    log_progress("Run complete.", output_dir)
     return {"messages": messages}
 
 
-agent = type("Agent", (), {"invoke": staticmethod(lambda inp: _run_agent(inp["messages"][0].content))})()
+class _AgentRuntime:
+    @staticmethod
+    def invoke(payload: dict):
+        question = payload["messages"][0].content
+        result = _run_agent(question)
+        return result
+
+
+agent = _AgentRuntime()
+
+
+def run_research(question: str, output_dir: str | Path | None = None, fresh: bool = False) -> str:
+    """Entry point used by the evaluation harness.
+
+    Returns
+    -------
+    str
+        Final report markdown text.
+    """
+    out_dir = initialize_runtime(output_dir=output_dir, force=fresh)
+    result = _run_agent(question, output_dir=out_dir, fresh=fresh)
+
+    final_report = out_dir / "final_report.md"
+    if final_report.exists():
+        return final_report.read_text(encoding="utf-8")
+
+    # Fallback to captured message content
+    for msg in reversed(result.get("messages", [])):
+        content = getattr(msg, "content", "")
+        if isinstance(content, str) and content.strip():
+            return content
+    raise RuntimeError("No final report produced by agent")
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    question = (
+
+def _build_default_question() -> str:
+    return (
         "CONTEXT:" +
-"MALA'IKA is Sety.io's emergency response management platform, being tested with an Uber partnership in Lagos and Abuja. It supports SOS calls/form intake from users (in this case, Uber drivers/riders), Command Center validation by agents, responder dispatch, incident tracking, evidence capture, operational analytics, and Uber-facing reports." +
+"MALA\'IKA is Sety.io's emergency response management platform, being tested with an Uber partnership in Lagos and Abuja. It supports SOS calls/form intake from users (in this case, Uber drivers/riders), Command Center validation by agents, responder dispatch, incident tracking, evidence capture, operational analytics, and Uber-facing reports." +
 "Tagline: Technology for Saving Lives"+
 "The MVP is focused on the Uber emergency response vertical:" +
 "1. An Uber driver/rider triggers an SOS." +
@@ -564,23 +619,46 @@ if __name__ == "__main__":
 "RESEARCH QUESTION" +
 "The main point of your research is on the question of what would be the most optimal in option for handling calls, in terms of price and quality of service in Nigeria. Compare between using Twilio, and Cloudtalk API to set up the emergency lines which command centre agnets will answer when a requester calls, collect transcripts, which we can then use for automatically creating incidents for agents to then manage by parsing the transcript with an LLM. Compare pricing, users reviews and forum discussions about them, especially on how htey perform in Nigeria, etc. return a full breakdown of the process that will be involved, step by step, for each approach, then make the comaprisons. Think through the user flow, and the processes that will be required for this flow to be complete, both on the requester and agent ends."
     )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run research agent")
+    parser.add_argument("--question", default="", help="Research question")
+    parser.add_argument("--question-file", default="", help="Path to file containing research question")
+    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Output directory")
+    parser.add_argument("--fresh", action="store_true", help="Ignore cached files and regenerate")
+
+    args = parser.parse_args()
+
+    question = args.question.strip()
+    if args.question_file:
+        p = Path(args.question_file)
+        if p.exists():
+            question = p.read_text(encoding="utf-8").strip()
+    if not question:
+        question = _build_default_question()
+
+    report = run_research(question=question, output_dir=args.output_dir, fresh=args.fresh)
+
     print(f"\n{'='*60}")
     print(f"Research question: {question}")
-    print(f"Orchestrator: OpenRouter / {ORCHESTRATOR_MODEL}")
+    print(f"Orchestrator: Anthropic / {ORCHESTRATOR_MODEL}")
     print(f"Sub-agents:   Anthropic / {SUBAGENT_MODEL}")
     print(f"Max searches per sub-agent: {MAX_SUBAGENT_SEARCHES}")
+    print(f"Output dir: {Path(args.output_dir).resolve()}")
     print(f"{'='*60}\n")
 
-    result = agent.invoke({"messages": [HumanMessage(content=question)]})
-
-    print(f"\n{'='*60}")
+    print(f"{'='*60}")
     print("FINAL RESPONSE:")
     print(f"{'='*60}")
-    for msg in result.get("messages", []):
-        if hasattr(msg, "content") and msg.content:
-            print(msg.content)
+    print(report)
 
     print(f"\n{'='*60}")
     print("Output files:")
-    for p in sorted(OUTPUT_DIR.glob("*.md")):
+    out_dir = Path(args.output_dir)
+    for p in sorted(out_dir.glob("*.md")):
         print(f"  {p} ({p.stat().st_size} bytes)")
+
+
+if __name__ == "__main__":
+    main()

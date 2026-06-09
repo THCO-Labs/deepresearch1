@@ -5,4 +5,6 @@ langchain
 langchain-openai
 langchain-anthropic
 langchain-core
+anthropic
+openai
 python-dotenv
